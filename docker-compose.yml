@@ -1,0 +1,26 @@
+services:
+  postgres:
+    image: postgres:18.3
+    container_name: mcp-postgres-demo
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: mcp_demo
+      POSTGRES_USER: mcp_user
+      POSTGRES_PASSWORD: mcp_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+
+  adminer:
+    image: adminer:5.4.2
+    container_name: mcp-adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:

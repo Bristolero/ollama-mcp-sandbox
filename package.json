@@ -1,0 +1,17 @@
+{
+  "name": "mcp-postgres-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal MCP + Postgres learning project with a read-only database tool.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest",
+    "dotenv": "latest",
+    "pg": "latest",
+    "zod": "latest"
+  }
+}

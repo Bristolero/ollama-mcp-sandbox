@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "postgres-demo": {
+      "command": "node",
+      "args": [
+        "src/server.js"
+      ],
+      "env": {
+        "POSTGRES_HOST": "localhost",
+        "POSTGRES_PORT": "5432",
+        "POSTGRES_DB": "mcp_demo",
+        "POSTGRES_USER": "mcp_user",
+        "POSTGRES_PASSWORD": "mcp_password",
+        "MAX_ROWS": "50"
+      }
+    }
+  }
+}
