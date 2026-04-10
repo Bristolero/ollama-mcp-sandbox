@@ -2,27 +2,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-try:
-    from transformers import BitsAndBytesConfig
-except ImportError:
-    BitsAndBytesConfig = None
+from urllib import error, request
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL_DIR = ROOT / "models" / "qwen3-4b-instruct-2507"
 DEFAULT_PROMPT_FILE = ROOT / "prompts" / "agent-prompt.md"
+DEFAULT_OLLAMA_MODEL = "qwen/qwen3-4b-instruct-2507"
+DEFAULT_OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
 
-SYSTEM_PROMPT_TEMPLATE = """You are a local database agent powered by Qwen.
+SYSTEM_PROMPT_TEMPLATE = """You are a local database agent powered by Qwen through Ollama.
 
 You can use MCP tools through a bridge process.
 You must solve the user's task by choosing exactly one action at a time.
@@ -67,6 +62,28 @@ def load_tool_catalog() -> str:
         lines.append(f"- {name}: {description} | input_schema={input_schema}")
 
     return "\n".join(lines)
+
+
+def ollama_request(base_url: str, path: str, payload: dict[str, Any], timeout: int = 600) -> dict[str, Any]:
+    body = json.dumps(payload).encode("utf-8")
+    api_request = request.Request(
+        url=f"{base_url.rstrip('/')}{path}",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with request.urlopen(api_request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Ollama API error {exc.code}: {details}") from exc
+    except error.URLError as exc:
+        raise RuntimeError(
+            "Could not reach Ollama. Make sure the Ollama container is running and reachable "
+            f"at {base_url}."
+        ) from exc
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
@@ -121,33 +138,25 @@ def render_messages(system_prompt: str, user_task: str, transcript: list[dict[st
 
 
 def generate_action(
-    tokenizer: AutoTokenizer,
-    model: AutoModelForCausalLM,
+    ollama_url: str,
+    model_name: str,
     system_prompt: str,
     user_task: str,
     transcript: list[dict[str, str]],
-    max_new_tokens: int,
 ) -> dict[str, Any]:
     messages = render_messages(system_prompt, user_task, transcript)
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    model_input_device = next(model.parameters()).device
-    inputs = tokenizer(prompt, return_tensors="pt").to(model_input_device)
-
-    with torch.inference_mode():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-
-    generated_tokens = outputs[0][inputs["input_ids"].shape[-1] :]
-    text = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "stream": False,
+        "format": "json",
+        "options": {
+            "temperature": 0,
+        },
+    }
+    response = ollama_request(ollama_url, "/api/chat", payload)
+    message = response.get("message", {})
+    text = str(message.get("content", "")).strip()
     print("Raw model output:", flush=True)
     print(text, flush=True)
     return extract_json_object(text)
@@ -165,76 +174,27 @@ def call_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
     )
 
 
-def choose_dtype() -> torch.dtype:
-    if torch.cuda.is_available():
-        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    return torch.float32
-
-
-def build_model_kwargs(load_in_4bit: bool) -> dict[str, Any]:
-    dtype = choose_dtype()
-
-    model_kwargs: dict[str, Any] = {
-        "torch_dtype": dtype,
-        "low_cpu_mem_usage": True,
-    }
-
-    if torch.cuda.is_available():
-        model_kwargs["device_map"] = "auto"
-
-    if load_in_4bit:
-        if not torch.cuda.is_available():
-            raise RuntimeError("4-bit loading requires a CUDA-capable PyTorch install and visible GPU.")
-
-        if BitsAndBytesConfig is None:
-            raise RuntimeError(
-                "4-bit loading requested, but BitsAndBytesConfig is unavailable. "
-                "Install a compatible transformers/bitsandbytes stack first."
-            )
-
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=dtype,
-        )
-
-    return model_kwargs
-
-
-def load_model(model_dir: Path, load_in_4bit: bool) -> tuple[AutoTokenizer, AutoModelForCausalLM]:
-    tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model_kwargs = build_model_kwargs(load_in_4bit=load_in_4bit)
-    model = AutoModelForCausalLM.from_pretrained(str(model_dir), **model_kwargs)
-
-    if not torch.cuda.is_available():
-        print("No CUDA found!", flush=True)
-        model.to("cpu")
-
-    return tokenizer, model
-
-
-def run_agent(model_dir: Path, task: str, max_steps: int, max_new_tokens: int, load_in_4bit: bool) -> str:
+def run_agent(
+    ollama_url: str,
+    model_name: str,
+    task: str,
+    max_steps: int,
+) -> str:
     tool_catalog = load_tool_catalog()
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(tool_catalog=tool_catalog)
-    print("Task received. Initializing model...", flush=True)
-    print(f"Model directory: {model_dir}", flush=True)
-    print(f"4-bit quantization enabled: {load_in_4bit}", flush=True)
-    tokenizer, model = load_model(model_dir, load_in_4bit=load_in_4bit)
+    print("Task received. Initializing agent...", flush=True)
+    print(f"Ollama URL: {ollama_url}", flush=True)
+    print(f"Ollama model: {model_name}", flush=True)
     transcript: list[dict[str, str]] = []
 
     for step in range(1, max_steps + 1):
         print(f"\n--- Step {step}/{max_steps} ---", flush=True)
         action = generate_action(
-            tokenizer=tokenizer,
-            model=model,
+            ollama_url=ollama_url,
+            model_name=model_name,
             system_prompt=system_prompt,
             user_task=task,
             transcript=transcript,
-            max_new_tokens=max_new_tokens,
         )
         print(f"Parsed action: {json.dumps(action, ensure_ascii=True)}", flush=True)
 
@@ -310,11 +270,16 @@ def run_agent(model_dir: Path, task: str, max_steps: int, max_new_tokens: int, l
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a local Qwen agent against MCP tools.")
+    parser = argparse.ArgumentParser(description="Run a local Qwen agent against MCP tools through Ollama.")
     parser.add_argument(
-        "--model-dir",
-        default=str(DEFAULT_MODEL_DIR),
-        help="Path to the local model directory.",
+        "--model",
+        default=DEFAULT_OLLAMA_MODEL,
+        help="Ollama model name to use.",
+    )
+    parser.add_argument(
+        "--ollama-url",
+        default=DEFAULT_OLLAMA_URL,
+        help="Base URL for the Ollama HTTP API.",
     )
     parser.add_argument(
         "--prompt-file",
@@ -327,27 +292,14 @@ def main() -> None:
         default=8,
         help="Maximum number of MCP tool turns before stopping.",
     )
-    parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=256,
-        help="Maximum tokens to generate for each step.",
-    )
-    parser.add_argument(
-        "--load-in-4bit",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Use 4-bit quantization when loading the model.",
-    )
     args = parser.parse_args()
 
     prompt_text = Path(args.prompt_file).read_text(encoding="utf-8").strip()
     answer = run_agent(
-        model_dir=Path(args.model_dir),
+        ollama_url=args.ollama_url,
+        model_name=args.model,
         task=prompt_text,
         max_steps=args.max_steps,
-        max_new_tokens=args.max_new_tokens,
-        load_in_4bit=args.load_in_4bit,
     )
     print(answer)
 

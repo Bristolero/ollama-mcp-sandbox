@@ -1,8 +1,8 @@
 {
-  "name": "mcp-postgres-demo",
+  "name": "ollama-mcp-sandbox",
   "version": "1.0.0",
   "private": true,
-  "description": "Minimal MCP + Postgres learning project with a read-only database tool.",
+  "description": "Local MCP sandbox with Postgres tools, OS tools, and an Ollama-backed agent.",
   "type": "module",
   "scripts": {
     "start": "node src/server.js",

@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:18.3
-    container_name: mcp-postgres-demo
+    container_name: ollama-mcp-postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: mcp_demo
@@ -22,5 +22,15 @@ services:
     depends_on:
       - postgres
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: mcp-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
 volumes:
   postgres_data:
+  ollama_data:
